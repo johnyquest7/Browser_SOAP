@@ -50,6 +50,11 @@ const state = {
   audioContext: null,
 };
 
+const TARGET_SAMPLE_RATE = 16000;
+const MAX_AUDIO_CHUNK_SECONDS = 28;
+const AUDIO_CHUNK_OVERLAP_SECONDS = 0.5;
+const TRANSCRIPT_CLEANUP_MAX_TOKENS = 512;
+
 function log(message) {
   const stamp = new Date().toLocaleTimeString();
   ui.log.textContent += `[${stamp}] ${message}\n`;
@@ -140,6 +145,22 @@ function getSupportedRecordingMimeType() {
   return '';
 }
 
+async function resampleAudioBuffer(inputBuffer, targetSampleRate = TARGET_SAMPLE_RATE) {
+  if (inputBuffer.sampleRate === targetSampleRate) {
+    return inputBuffer;
+  }
+
+  const sourceData = inputBuffer.getChannelData(0);
+  const duration = inputBuffer.duration;
+  const targetLength = Math.max(1, Math.round(duration * targetSampleRate));
+  const offlineContext = new OfflineAudioContext(1, targetLength, targetSampleRate);
+  const source = offlineContext.createBufferSource();
+  source.buffer = inputBuffer;
+  source.connect(offlineContext.destination);
+  source.start(0);
+  return offlineContext.startRendering();
+}
+
 async function decodeBlobToMonoAudioBuffer(blob) {
   const audioContext = getAudioContext();
   if (audioContext.state === 'suspended') {
@@ -163,7 +184,59 @@ async function decodeBlobToMonoAudioBuffer(blob) {
     }
   }
 
-  return mono;
+  return resampleAudioBuffer(mono, TARGET_SAMPLE_RATE);
+}
+
+function sliceAudioBuffer(audioBuffer, startSeconds, endSeconds) {
+  const startFrame = Math.max(0, Math.floor(startSeconds * audioBuffer.sampleRate));
+  const endFrame = Math.min(audioBuffer.length, Math.ceil(endSeconds * audioBuffer.sampleRate));
+  const frameCount = Math.max(1, endFrame - startFrame);
+  const chunk = new AudioBuffer({
+    length: frameCount,
+    numberOfChannels: 1,
+    sampleRate: audioBuffer.sampleRate,
+  });
+  const source = audioBuffer.getChannelData(0).subarray(startFrame, endFrame);
+  chunk.getChannelData(0).set(source);
+  return chunk;
+}
+
+function splitAudioBufferIntoChunks(audioBuffer, maxChunkSeconds = MAX_AUDIO_CHUNK_SECONDS, overlapSeconds = AUDIO_CHUNK_OVERLAP_SECONDS) {
+  const chunks = [];
+  const duration = audioBuffer.duration;
+
+  if (duration <= maxChunkSeconds) {
+    return [{
+      buffer: audioBuffer,
+      startSeconds: 0,
+      endSeconds: duration,
+      index: 1,
+    }];
+  }
+
+  const stepSeconds = Math.max(1, maxChunkSeconds - overlapSeconds);
+  let cursor = 0;
+  let index = 1;
+
+  while (cursor < duration) {
+    const end = Math.min(duration, cursor + maxChunkSeconds);
+    chunks.push({
+      buffer: sliceAudioBuffer(audioBuffer, cursor, end),
+      startSeconds: cursor,
+      endSeconds: end,
+      index,
+    });
+
+    if (end >= duration) break;
+    cursor += stepSeconds;
+    index += 1;
+  }
+
+  return chunks;
+}
+
+function secondsLabel(value) {
+  return `${value.toFixed(1)}s`;
 }
 
 function formatDuration(seconds) {
@@ -263,24 +336,35 @@ function wrapUserTurn(content) {
   return `<start_of_turn>user\n${content}<end_of_turn>\n<start_of_turn>model\n`;
 }
 
-async function generateText(input, outputElement) {
+async function generateText(input, outputElement, options = {}) {
   if (!state.llm) throw new Error('Model is not initialized.');
   setBusy(true);
   outputElement.value = '';
 
   try {
-    await state.llm.generateResponse(input, (partialResult, done) => {
-      outputElement.value += partialResult;
-      if (done) {
-        setBusy(false);
-        updateButtons();
-      }
+    await new Promise((resolve, reject) => {
+      let settled = false;
+      state.llm.generateResponse(input, (partialResult, done) => {
+        outputElement.value += partialResult;
+        if (done && !settled) {
+          settled = true;
+          resolve();
+        }
+      }, options).catch((error) => {
+        if (!settled) {
+          settled = true;
+          reject(error);
+        }
+      });
     });
   } catch (error) {
     setBusy(false);
     updateButtons();
     throw error;
   }
+
+  setBusy(false);
+  updateButtons();
 }
 
 function buildTranscriptPrompt() {
@@ -331,8 +415,46 @@ function buildSoapPrompt(transcript) {
 
 async function transcribeAudio() {
   if (!state.audioBuffer) throw new Error('No audio available.');
-  log('Starting transcription.');
-  await generateText(buildTranscriptPrompt(), ui.transcript);
+
+  const chunks = splitAudioBufferIntoChunks(state.audioBuffer);
+  log(`Starting transcription${chunks.length > 1 ? ` in ${chunks.length} chunks` : ''}.`);
+
+  if (chunks.length === 1) {
+    await generateText(buildTranscriptPrompt(state.audioBuffer), ui.transcript);
+    ui.transcript.value = ui.transcript.value.trim();
+    log('Transcription finished.');
+    updateButtons();
+    return;
+  }
+
+  const transcripts = [];
+  for (let i = 0; i < chunks.length; i += 1) {
+    const chunk = chunks[i];
+    const tmpOutput = { value: '' };
+    log(`Transcribing chunk ${i + 1}/${chunks.length} (${secondsLabel(chunk.startSeconds)}–${secondsLabel(chunk.endSeconds)}).`);
+    await generateText(
+      buildTranscriptPrompt(chunk.buffer, {
+        index: i + 1,
+        total: chunks.length,
+        startSeconds: chunk.startSeconds,
+        endSeconds: chunk.endSeconds,
+      }),
+      tmpOutput,
+      { maxTokens: Math.max(256, Number(ui.maxTokens.value) || 1536) }
+    );
+    transcripts.push(tmpOutput.value.trim());
+    ui.transcript.value = transcripts.filter(Boolean).join('
+');
+  }
+
+  const combinedTranscript = transcripts.filter(Boolean).join('
+');
+  log('Cleaning merged transcript to remove overlap duplicates.');
+  await generateText(
+    buildTranscriptCleanupPrompt(combinedTranscript),
+    ui.transcript,
+    { maxTokens: TRANSCRIPT_CLEANUP_MAX_TOKENS }
+  );
   ui.transcript.value = ui.transcript.value.trim();
   log('Transcription finished.');
   updateButtons();
