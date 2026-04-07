@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gemma 3n Endocrinology Scribe</title>
+  <meta name="description" content="A fully local browser demo for medical transcription and SOAP note generation using Gemma 3n E2B.">
+  <link rel="stylesheet" href="./styles.css">
+  <script src="./coi-serviceworker.js"></script>
+</head>
+<body>
+  <div class="page">
+    <header class="hero card">
+      <div>
+        <p class="eyebrow">On-device Chrome demo</p>
+        <h1>Gemma 3n Endocrinology Scribe</h1>
+        <p class="subtle">
+          Record audio locally in Chrome, transcribe it on-device, and generate a SOAP note entirely in the browser.
+        </p>
+      </div>
+      <div class="hero-status">
+        <div class="status-pill" id="browserStatus">Checking browser…</div>
+        <div class="status-pill" id="isolationStatus">Checking isolation…</div>
+        <div class="status-pill" id="modelStatus">Model not loaded</div>
+      </div>
+    </header>
+
+    <main class="grid">
+      <section class="card">
+        <h2>1. Model</h2>
+        <label for="modelUrl">Public model URL</label>
+        <input
+          id="modelUrl"
+          type="url"
+          placeholder="https://your-host.example.com/gemma-3n-E2B-it-int4-Web.litertlm"
+          autocomplete="off"
+        >
+        <p class="help">
+          Paste a publicly accessible URL for <code>gemma-3n-E2B-it-int4-Web.litertlm</code>, or load the model from disk.
+        </p>
+
+        <label for="modelFile">Or choose a local model file</label>
+        <input id="modelFile" type="file" accept=".litertlm,application/octet-stream">
+
+        <div class="row row-2">
+          <div>
+            <label for="maxTokens">Max tokens</label>
+            <input id="maxTokens" type="number" min="256" max="4096" step="64" value="1536">
+          </div>
+          <div>
+            <label for="temperature">Temperature</label>
+            <input id="temperature" type="number" min="0" max="1.5" step="0.1" value="0.2">
+          </div>
+        </div>
+
+        <div class="actions">
+          <button id="initModelBtn" class="primary">Initialize model</button>
+          <button id="disposeModelBtn" disabled>Unload model</button>
+        </div>
+
+        <details>
+          <summary>Recommended model path examples</summary>
+          <ul>
+            <li>Public object storage or CDN URL</li>
+            <li>Public Hugging Face repo URL ending in <code>/resolve/main/gemma-3n-E2B-it-int4-Web.litertlm</code></li>
+            <li>Local file selected from disk for the safest live demo</li>
+          </ul>
+        </details>
+      </section>
+
+      <section class="card">
+        <h2>2. Audio</h2>
+        <div class="actions">
+          <button id="recordBtn" class="primary">Start recording</button>
+          <button id="stopBtn" disabled>Stop</button>
+          <button id="clearAudioBtn" disabled>Clear audio</button>
+        </div>
+        <p class="help">Chrome microphone capture is used only on-device. Nothing is uploaded by this app.</p>
+
+        <label for="audioFile">Or upload an audio file</label>
+        <input id="audioFile" type="file" accept="audio/*">
+
+        <audio id="audioPreview" controls></audio>
+        <div class="meta-grid">
+          <div><span class="meta-label">Duration</span><span id="audioDuration">—</span></div>
+          <div><span class="meta-label">Sample rate</span><span id="audioRate">—</span></div>
+          <div><span class="meta-label">Channels</span><span id="audioChannels">—</span></div>
+        </div>
+      </section>
+
+      <section class="card full-width">
+        <h2>3. Prompt settings</h2>
+        <div class="row row-2">
+          <div>
+            <label for="specialty">Specialty</label>
+            <select id="specialty">
+              <option value="Endocrinology" selected>Endocrinology</option>
+              <option value="General Internal Medicine">General Internal Medicine</option>
+              <option value="Primary Care">Primary Care</option>
+              <option value="Custom">Custom</option>
+            </select>
+          </div>
+          <div>
+            <label for="noteStyle">Note style</label>
+            <select id="noteStyle">
+              <option value="Concise outpatient SOAP" selected>Concise outpatient SOAP</option>
+              <option value="Detailed outpatient SOAP">Detailed outpatient SOAP</option>
+              <option value="Assessment and Plan focused">Assessment and Plan focused</option>
+            </select>
+          </div>
+        </div>
+
+        <label for="contextNotes">Additional context</label>
+        <textarea id="contextNotes" rows="4" placeholder="Example: Thyroid follow-up visit. Use generic patient identifiers. Do not invent vitals, labs, medication doses, or exam findings not stated in the transcript."></textarea>
+      </section>
+
+      <section class="card full-width">
+        <h2>4. Transcript</h2>
+        <div class="actions">
+          <button id="transcribeBtn" class="primary" disabled>Transcribe audio</button>
+          <button id="copyTranscriptBtn" disabled>Copy transcript</button>
+        </div>
+        <textarea id="transcript" rows="12" placeholder="Transcript will appear here."></textarea>
+      </section>
+
+      <section class="card full-width">
+        <h2>5. SOAP note</h2>
+        <div class="actions">
+          <button id="soapBtn" class="primary" disabled>Generate SOAP</button>
+          <button id="runAllBtn" disabled>Transcribe + SOAP</button>
+          <button id="copySoapBtn" disabled>Copy SOAP</button>
+          <button id="downloadSoapBtn" disabled>Download .txt</button>
+          <button id="cancelBtn" disabled>Cancel generation</button>
+        </div>
+        <textarea id="soapNote" rows="18" placeholder="SOAP note will appear here."></textarea>
+      </section>
+
+      <section class="card full-width">
+        <h2>Runtime log</h2>
+        <pre id="log" class="log"></pre>
+      </section>
+
+      <section class="card full-width warning">
+        <h2>Important</h2>
+        <p>
+          This demo is for research and presentation purposes. Review all output before clinical use. The prompts are intentionally strict about not inventing findings, but no LLM note generator should be trusted without human verification.
+        </p>
+      </section>
+    </main>
+  </div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
