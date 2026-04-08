@@ -3,6 +3,10 @@ import { FilesetResolver, LlmInference } from 'https://cdn.jsdelivr.net/npm/@med
 const WASM_ROOT = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-genai@0.10.25/wasm';
 const STORAGE_KEY_MODEL_URL = 'gemma3n_demo_model_url';
 const STORAGE_KEY_CONTEXT = 'gemma3n_demo_context';
+const TARGET_SAMPLE_RATE = 16000;
+const MAX_AUDIO_CHUNK_SECONDS = 28;
+const AUDIO_CHUNK_OVERLAP_SECONDS = 0.5;
+const TRANSCRIPT_CLEANUP_MAX_TOKENS = 512;
 
 const ui = {
   browserStatus: document.getElementById('browserStatus'),
@@ -49,11 +53,6 @@ const state = {
   audioBuffer: null,
   audioContext: null,
 };
-
-const TARGET_SAMPLE_RATE = 16000;
-const MAX_AUDIO_CHUNK_SECONDS = 28;
-const AUDIO_CHUNK_OVERLAP_SECONDS = 0.5;
-const TRANSCRIPT_CLEANUP_MAX_TOKENS = 512;
 
 function log(message) {
   const stamp = new Date().toLocaleTimeString();
@@ -105,6 +104,7 @@ function updateButtons() {
   const hasModel = !!state.llm;
   const hasAudio = !!state.audioBuffer;
   const hasTranscript = ui.transcript.value.trim().length > 0;
+  const hasSoap = ui.soapNote.value.trim().length > 0;
 
   ui.disposeModelBtn.disabled = !hasModel || state.busy;
   ui.initModelBtn.disabled = state.busy;
@@ -116,8 +116,8 @@ function updateButtons() {
   ui.runAllBtn.disabled = !hasModel || !hasAudio || state.busy;
   ui.cancelBtn.disabled = !state.busy || !state.llm;
   ui.copyTranscriptBtn.disabled = !hasTranscript;
-  ui.copySoapBtn.disabled = !ui.soapNote.value.trim();
-  ui.downloadSoapBtn.disabled = !ui.soapNote.value.trim();
+  ui.copySoapBtn.disabled = !hasSoap;
+  ui.downloadSoapBtn.disabled = !hasSoap;
 }
 
 function setBusy(isBusy) {
@@ -150,7 +150,6 @@ async function resampleAudioBuffer(inputBuffer, targetSampleRate = TARGET_SAMPLE
     return inputBuffer;
   }
 
-  const sourceData = inputBuffer.getChannelData(0);
   const duration = inputBuffer.duration;
   const targetLength = Math.max(1, Math.round(duration * targetSampleRate));
   const offlineContext = new OfflineAudioContext(1, targetLength, targetSampleRate);
@@ -227,7 +226,9 @@ function splitAudioBufferIntoChunks(audioBuffer, maxChunkSeconds = MAX_AUDIO_CHU
       index,
     });
 
-    if (end >= duration) break;
+    if (end >= duration) {
+      break;
+    }
     cursor += stepSeconds;
     index += 1;
   }
@@ -250,8 +251,14 @@ async function setAudioBlob(blob) {
   state.audioBlob = blob;
   state.audioBuffer = await decodeBlobToMonoAudioBuffer(blob);
 
+  if (ui.audioPreview.dataset.objectUrl) {
+    URL.revokeObjectURL(ui.audioPreview.dataset.objectUrl);
+    delete ui.audioPreview.dataset.objectUrl;
+  }
+
   const objectUrl = URL.createObjectURL(blob);
   ui.audioPreview.src = objectUrl;
+  ui.audioPreview.dataset.objectUrl = objectUrl;
   ui.audioDuration.textContent = formatDuration(state.audioBuffer.duration);
   ui.audioRate.textContent = `${state.audioBuffer.sampleRate} Hz`;
   ui.audioChannels.textContent = `${state.audioBuffer.numberOfChannels}`;
@@ -260,8 +267,9 @@ async function setAudioBlob(blob) {
 }
 
 function clearAudio() {
-  if (ui.audioPreview.src) {
-    URL.revokeObjectURL(ui.audioPreview.src);
+  if (ui.audioPreview.dataset.objectUrl) {
+    URL.revokeObjectURL(ui.audioPreview.dataset.objectUrl);
+    delete ui.audioPreview.dataset.objectUrl;
   }
   state.audioBlob = null;
   state.audioBuffer = null;
@@ -307,10 +315,7 @@ async function initializeModel() {
     supportAudio: true,
   };
 
-  log(localFile
-    ? `Loading local model file: ${localFile.name}`
-    : `Loading model from URL: ${modelUrl}`);
-
+  log(localFile ? `Loading local model file: ${localFile.name}` : `Loading model from URL: ${modelUrl}`);
   state.llm = await LlmInference.createFromOptions(state.genaiFileset, options);
   setPill(ui.modelStatus, 'Model ready', 'ok');
   log('Model initialized successfully.');
@@ -337,20 +342,27 @@ function wrapUserTurn(content) {
 }
 
 async function generateText(input, outputElement, options = {}) {
-  if (!state.llm) throw new Error('Model is not initialized.');
+  if (!state.llm) {
+    throw new Error('Model is not initialized.');
+  }
+
   setBusy(true);
   outputElement.value = '';
 
   try {
     await new Promise((resolve, reject) => {
       let settled = false;
-      state.llm.generateResponse(input, (partialResult, done) => {
-        outputElement.value += partialResult;
-        if (done && !settled) {
-          settled = true;
-          resolve();
-        }
-      }, options).catch((error) => {
+      state.llm.generateResponse(
+        input,
+        (partialResult, done) => {
+          outputElement.value += partialResult;
+          if (done && !settled) {
+            settled = true;
+            resolve();
+          }
+        },
+        options,
+      ).catch((error) => {
         if (!settled) {
           settled = true;
           reject(error);
@@ -367,11 +379,10 @@ async function generateText(input, outputElement, options = {}) {
   updateButtons();
 }
 
-function buildTranscriptPrompt() {
+function buildTranscriptPrompt(audioBuffer, metadata = {}) {
   const specialty = ui.specialty.value === 'Custom' ? 'medical' : ui.specialty.value;
   const context = ui.contextNotes.value.trim();
-
-  const instruction = [
+  const prefixLines = [
     `You are an on-device ${specialty} medical transcription assistant.`,
     'Transcribe the attached dictated clinical audio into a clean, faithful transcript.',
     'Rules:',
@@ -380,15 +391,38 @@ function buildTranscriptPrompt() {
     '- If a segment is unclear, write [inaudible] rather than guessing.',
     '- Remove filler words only when they do not change meaning.',
     '- Return only the transcript and no preamble.',
-    context ? `Additional context: ${context}` : '',
-  ].filter(Boolean).join('\n');
+  ];
+
+  if (metadata.total && metadata.total > 1) {
+    prefixLines.push(`This is chunk ${metadata.index} of ${metadata.total}, covering approximately ${secondsLabel(metadata.startSeconds)} to ${secondsLabel(metadata.endSeconds)} of the full recording.`);
+    prefixLines.push('Transcribe only this chunk. Do not summarize prior or future chunks.');
+  }
+
+  if (context) {
+    prefixLines.push(`Additional context: ${context}`);
+  }
 
   return [
     '<start_of_turn>user\n',
-    instruction + '\n',
-    { audioSource: state.audioBuffer },
+    `${prefixLines.join('\n')}\n`,
+    { audioSource: audioBuffer },
     '<end_of_turn>\n<start_of_turn>model\n',
   ];
+}
+
+function buildTranscriptCleanupPrompt(combinedTranscript) {
+  return wrapUserTurn([
+    'You are cleaning a multi-part medical transcript that came from overlapping audio chunks.',
+    'Rewrite it as one continuous clean transcript.',
+    'Rules:',
+    '- Remove duplicated words, phrases, or sentences caused by overlapping chunk boundaries.',
+    '- Preserve the original meaning and wording as much as possible.',
+    '- Do not add new clinical facts.',
+    '- Return only the cleaned transcript and no preamble.',
+    '',
+    'Transcript to clean:',
+    combinedTranscript,
+  ].join('\n'));
 }
 
 function buildSoapPrompt(transcript) {
@@ -414,7 +448,9 @@ function buildSoapPrompt(transcript) {
 }
 
 async function transcribeAudio() {
-  if (!state.audioBuffer) throw new Error('No audio available.');
+  if (!state.audioBuffer) {
+    throw new Error('No audio available.');
+  }
 
   const chunks = splitAudioBufferIntoChunks(state.audioBuffer);
   log(`Starting transcription${chunks.length > 1 ? ` in ${chunks.length} chunks` : ''}.`);
@@ -428,6 +464,8 @@ async function transcribeAudio() {
   }
 
   const transcripts = [];
+  const perChunkMaxTokens = Math.max(256, Number(ui.maxTokens.value) || 1536);
+
   for (let i = 0; i < chunks.length; i += 1) {
     const chunk = chunks[i];
     const tmpOutput = { value: '' };
@@ -440,20 +478,18 @@ async function transcribeAudio() {
         endSeconds: chunk.endSeconds,
       }),
       tmpOutput,
-      { maxTokens: Math.max(256, Number(ui.maxTokens.value) || 1536) }
+      { maxTokens: perChunkMaxTokens },
     );
     transcripts.push(tmpOutput.value.trim());
-    ui.transcript.value = transcripts.filter(Boolean).join('
-');
+    ui.transcript.value = transcripts.filter(Boolean).join('\n');
   }
 
-  const combinedTranscript = transcripts.filter(Boolean).join('
-');
+  const combinedTranscript = transcripts.filter(Boolean).join('\n');
   log('Cleaning merged transcript to remove overlap duplicates.');
   await generateText(
     buildTranscriptCleanupPrompt(combinedTranscript),
     ui.transcript,
-    { maxTokens: TRANSCRIPT_CLEANUP_MAX_TOKENS }
+    { maxTokens: TRANSCRIPT_CLEANUP_MAX_TOKENS },
   );
   ui.transcript.value = ui.transcript.value.trim();
   log('Transcription finished.');
@@ -462,7 +498,9 @@ async function transcribeAudio() {
 
 async function generateSoap() {
   const transcript = ui.transcript.value.trim();
-  if (!transcript) throw new Error('Transcript is empty.');
+  if (!transcript) {
+    throw new Error('Transcript is empty.');
+  }
   log('Generating SOAP note.');
   await generateText(buildSoapPrompt(transcript), ui.soapNote);
   ui.soapNote.value = ui.soapNote.value.trim();
@@ -483,7 +521,14 @@ async function startRecording() {
   clearAudio();
   state.audioChunks = [];
   state.recordingMimeType = getSupportedRecordingMimeType();
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      channelCount: 1,
+      noiseSuppression: true,
+      echoCancellation: true,
+      autoGainControl: true,
+    },
+  });
   state.mediaStream = stream;
 
   state.mediaRecorder = state.recordingMimeType
@@ -507,7 +552,7 @@ async function startRecording() {
       log(`Failed to decode recorded audio: ${error.message}`);
       alert(`Failed to decode recorded audio: ${error.message}`);
     } finally {
-      state.mediaStream?.getTracks().forEach(track => track.stop());
+      state.mediaStream?.getTracks().forEach((track) => track.stop());
       state.mediaStream = null;
       state.mediaRecorder = null;
       state.audioChunks = [];
